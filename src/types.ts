@@ -4,6 +4,54 @@ export interface EmbeddingData {
   vec?: number[];
 }
 
+/**
+ * Newer Smart Connections (post-compaction) `.smart-env` layout: vectors live in
+ * sibling binary files, not inline. An entry points at one row of one file.
+ */
+export interface EmbeddingRef {
+  /** Binary file name inside the sibling directory, e.g. "mf_ccarbz". */
+  file: string;
+  /** Row index within that file: the vector starts at `file_i * dims * 4` bytes. */
+  file_i: number;
+}
+
+/** `embedding.default` maps each binary vector file to the row holding the vector. */
+export interface EmbeddingRefMap {
+  history?: unknown[];
+  default?: Record<string, EmbeddingRef>;
+}
+
+/** One block entry inside a source's `blocks_data` (newer layout). */
+export interface SourceBlockData {
+  /** Full block key, e.g. "Folder/Note.md#Heading#{1}". */
+  key?: string;
+  /** [startLine, endLine], 1-indexed inclusive */
+  lines?: [number, number];
+  size?: number;
+  should_embed?: boolean;
+  embedding?: EmbeddingRefMap;
+}
+
+/** A `smart_sources:` entry in `smart_sources/smart_sources.ajson` (newer layout). */
+export interface BinarySmartSource {
+  path: string;
+  class_name?: string;
+  embedding?: EmbeddingRefMap;
+  /** heading key -> block metadata; key here never contains the note path. */
+  blocks_data?: Record<string, SourceBlockData>;
+  last_import?: { mtime?: number; size?: number };
+  metadata?: Record<string, unknown>;
+}
+
+/** A row of `embedding_models/embedding_models.ajson`. */
+export interface EmbeddingModelRecord {
+  provider_key?: string;
+  model_key?: string;
+  /** Vector width — authoritative for slicing the binary files. */
+  dims?: number;
+  max_tokens?: number;
+}
+
 export interface SmartSource {
   path: string;
   class_name?: string;
@@ -36,6 +84,8 @@ export interface SmartEnvConfig {
   smart_sources?: {
     embed_model?: { adapter?: string; [key: string]: unknown };
   };
+  /** Present in the newer layout; names the `embedding_models` entry in use. */
+  embedding_models?: { default_model_key?: string };
 }
 
 export interface SearchResult {

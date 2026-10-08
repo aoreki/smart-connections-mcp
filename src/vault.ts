@@ -3,6 +3,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { blockNotePath, createVaultData, isFrontmatterBlock, parseAjson } from './ajson-loader.js';
+import { binaryFileStates, hasBinaryLayout, loadBinaryEnv, sourcesAjsonPath } from './binary-env.js';
 import { BlockNotFoundError, NoteNotFoundError } from './errors.js';
 import { resolveInsideVault } from './paths.js';
 import type { EmbeddingData, SmartEnvConfig, VaultData } from './types.js';
@@ -11,6 +12,21 @@ import { VectorIndex } from './vector-index.js';
 const RELOAD_THROTTLE_MS = 2000;
 const SNIPPET_MAX = 700;
 const FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---\r?\n/;
+
+/**
+ * Smart Connections stores its data two ways:
+ * - `legacy`: `.smart-env/multi/*.ajson` with vectors inline (`embeddings.<key>.vec`)
+ * - `binary`: `.smart-env/smart_sources/smart_sources.ajson` with vectors in sibling
+ *   binary files, referenced by row (see binary-env.ts)
+ */
+type Layout = 'legacy' | 'binary';
+
+function detectLayout(smartEnv: string): Layout | undefined {
+  // Prefer the newer layout: an upgraded vault can leave a stale `multi/` behind.
+  if (hasBinaryLayout(smartEnv)) return 'binary';
+  if (fs.existsSync(path.join(smartEnv, 'multi'))) return 'legacy';
+  return undefined;
+}
 
 function extractModelKey(config: SmartEnvConfig): string {
   const embedModel = config.smart_sources?.embed_model;
@@ -27,6 +43,19 @@ function extractModelKey(config: SmartEnvConfig): string {
   return fallback;
 }
 
+/**
+ * The newer layout also records the model in `embedding_models.ajson`, which is
+ * more reliable than `smart_env.json` — so an unreadable config must not sink the
+ * vault; an empty key just means "adopt whatever the data uses".
+ */
+function safeExtractModelKey(config: SmartEnvConfig): string {
+  try {
+    return extractModelKey(config);
+  } catch {
+    return '';
+  }
+}
+
 export class Vault {
   readonly name: string;
   readonly path: string;
@@ -38,7 +67,13 @@ export class Vault {
   private fileStates = new Map<string, string>(); // filename -> "mtimeMs:size"
   private lastCheck = 0;
 
-  private constructor(vaultPath: string, name: string, modelKey: string) {
+  private constructor(
+    vaultPath: string,
+    name: string,
+    modelKey: string,
+    private readonly layout: Layout,
+    private readonly config: SmartEnvConfig,
+  ) {
     this.path = vaultPath;
     this.name = name;
     this.declaredModelKey = modelKey;
@@ -60,15 +95,28 @@ export class Vault {
     const configPath = path.join(smartEnv, 'smart_env.json');
     if (!fs.existsSync(configPath)) throw new Error(`Missing ${configPath}`);
     const config = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as SmartEnvConfig;
-    const multi = path.join(smartEnv, 'multi');
-    if (!fs.existsSync(multi)) throw new Error(`Missing ${multi} — no embeddings generated yet?`);
-    const vault = new Vault(vaultPath, name, extractModelKey(config));
+
+    const layout = detectLayout(smartEnv);
+    if (!layout) {
+      throw new Error(
+        `No Smart Connections data in ${smartEnv} — expected "smart_sources/smart_sources.ajson" ` +
+          `(current plugin) or "multi/" (older plugin). Open the vault in Obsidian and let ` +
+          `Smart Connections finish indexing.`,
+      );
+    }
+
+    const modelKey = layout === 'binary' ? safeExtractModelKey(config) : extractModelKey(config);
+    const vault = new Vault(vaultPath, name, modelKey, layout, config);
     vault.loadAll();
     return vault;
   }
 
+  private smartEnvDir(): string {
+    return path.join(this.path, '.smart-env');
+  }
+
   private multiDir(): string {
-    return path.join(this.path, '.smart-env', 'multi');
+    return path.join(this.smartEnvDir(), 'multi');
   }
 
   private listAjsonFiles(): Map<string, string> {
@@ -87,10 +135,45 @@ export class Vault {
     parseAjson(content, this.data, (msg) => console.error(`[${this.name}] ${filename}: ${msg}`));
   }
 
+  /** Files whose state must be watched for changes, per layout. */
+  private snapshotFiles(): Map<string, string> {
+    return this.layout === 'legacy' ? this.listAjsonFiles() : binaryFileStates(this.smartEnvDir());
+  }
+
+  private filesUnchanged(): boolean {
+    let current: Map<string, string>;
+    try {
+      current = this.snapshotFiles();
+    } catch {
+      return false;
+    }
+    if (current.size !== this.fileStates.size) return false;
+    for (const [file, state] of current) {
+      if (this.fileStates.get(file) !== state) return false;
+    }
+    return true;
+  }
+
   private loadAll(): void {
     this.data = createVaultData();
-    this.fileStates = this.listAjsonFiles();
-    for (const filename of this.fileStates.keys()) this.parseFile(filename);
+    this.fileStates = this.snapshotFiles();
+    if (this.layout === 'legacy') {
+      for (const filename of this.fileStates.keys()) this.parseFile(filename);
+    } else {
+      try {
+        loadBinaryEnv(this.smartEnvDir(), this.data, this.config, this.declaredModelKey, (msg) =>
+          console.error(`[${this.name}] ${msg}`),
+        );
+      } catch (e) {
+        // A half-written file must not take the server down; drop the snapshot so
+        // the next throttled check retries instead of assuming we are up to date.
+        this.fileStates = new Map();
+        console.error(
+          `[${this.name}] failed to read ${sourcesAjsonPath(this.smartEnvDir())}: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
     this.rebuildIndex();
   }
 
@@ -156,19 +239,9 @@ export class Vault {
   maybeReload(now: number = Date.now()): void {
     if (now - this.lastCheck < RELOAD_THROTTLE_MS) return;
     this.lastCheck = now;
-    const current = this.listAjsonFiles();
-    const removed = [...this.fileStates.keys()].some((f) => !current.has(f));
-    if (removed) {
-      this.loadAll();
-      return;
-    }
-    const changed = [...current.entries()].filter(([f, state]) => this.fileStates.get(f) !== state);
-    if (changed.length === 0) return;
-    for (const [f, state] of changed) {
-      this.parseFile(f);
-      this.fileStates.set(f, state);
-    }
-    this.rebuildIndex();
+    // Stat first (cheap); only re-read the data when something actually changed.
+    if (this.filesUnchanged()) return;
+    this.loadAll();
   }
 
   readNote(notePath: string): string {

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Newer Smart Connections layouts load again.** Recent plugin versions dropped
+  `.smart-env/multi/` entirely: vectors moved into binary float32 files
+  (`smart_sources/<file>`, `smart_blocks/<file>`) that entries reference by row
+  index, note metadata moved to `smart_sources/smart_sources.ajson`, block
+  metadata into each source's `blocks_data`, and the model key/width into
+  `embedding_models/embedding_models.ajson`. Such a vault used to fail with
+  `Missing …/.smart-env/multi — no embeddings generated yet?` and, when it was the
+  only vault, `Error: no vaults loaded successfully.`. The layout is now detected
+  automatically; the older `multi/` layout keeps working unchanged. Block
+  `include_blocks` keys follow the new convention (single `#`, e.g. `#Intro`).
+- Freshness checks now watch the files that actually exist in each layout, so
+  edits (including appended binary rows) are still picked up without a restart.
+- A malformed or half-written `.smart-env` no longer aborts a tool call; the
+  vault reloads on the next check.
+
 ## 2.0.1 — 2026-08-21
 
 ### Fixed
